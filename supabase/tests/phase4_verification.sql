@@ -18,6 +18,7 @@ declare
   v_notif_id uuid := 'dddddddd-0000-0000-0000-000000000201';
   v_notif2_id uuid := 'dddddddd-0000-0000-0000-000000000202';
   v_notif3_id uuid := 'dddddddd-0000-0000-0000-000000000203';
+  v_notif_deadletter_id uuid;
   v_count integer;
   v_err text;
   v_submit_err text;
@@ -35,6 +36,7 @@ declare
 begin
   v_return_req_id := gen_random_uuid();
   v_return_request_no := 'REQ-P4-RETURN-' || v_setup_suffix;
+  v_notif_deadletter_id := gen_random_uuid();
 
   insert into auth.users (
     id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data
@@ -382,29 +384,57 @@ begin
   perform set_config('request.jwt.claim.role', 'service_role', true);
   perform set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000999', true);
 
-  -- ensure one processable row
-  update app.notification_queue
-  set status = 'queued',
-      retries = 0,
-      next_attempt_at = timezone('utc', now()),
-      locked_at = null,
-      locked_by = null
-  where id = v_notif_id;
+  -- Use a fresh fixture row and deterministic legal transitions:
+  -- processing -> failed via mark_notification_failed
+  -- failed -> processing via legal update
+  insert into app.notification_queue(
+    id,
+    event_name,
+    entity_name,
+    entity_id,
+    recipient_role,
+    payload,
+    channel,
+    status,
+    retries,
+    next_attempt_at
+  )
+  values (
+    v_notif_deadletter_id,
+    'evt-deadletter',
+    'parts_requests',
+    v_req_id,
+    'dispatcher',
+    '{}'::jsonb,
+    'sms',
+    'processing',
+    0,
+    timezone('utc', now())
+  )
+  on conflict do nothing;
 
   for v_count in 1..6 loop
-    perform app.claim_notifications(1, 'worker-fail');
-    begin
-      perform app.mark_notification_failed(v_notif_id, 'worker-fail', 'forced failure');
-    exception
-      when others then
-        null;
-    end;
+    perform app.mark_notification_failed(v_notif_deadletter_id, 'worker-fail', 'forced failure');
+
+    exit when exists (
+      select 1
+      from app.notification_queue nq
+      where nq.id = v_notif_deadletter_id
+        and nq.status = 'dead_letter'
+    );
+
+    update app.notification_queue
+    set status = 'processing',
+        locked_at = timezone('utc', now()),
+        locked_by = 'worker-fail'
+    where id = v_notif_deadletter_id
+      and status = 'failed';
   end loop;
 
   select count(*)
     into v_count
   from app.notification_queue nq
-  where nq.id = v_notif_id
+  where nq.id = v_notif_deadletter_id
     and nq.status = 'dead_letter';
 
   insert into phase4_test_results values (
